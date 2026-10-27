@@ -104,11 +104,9 @@
   Times New Roman, ГОСТ 7.32-2017, 54 с.). Сборка из этого каталога:
   `eval "$(/usr/libexec/path_helper)" && for i in 1 2 3; do xelatex -interaction=nonstopmode afonkin_iu9_52b_rpz.tex; done`
   (три прогона — для содержания и номера последней страницы).
-- Готовые PDF: `docs/explanatory_note/final/Афонькин_ИУ9-52Б_РПЗ.pdf`
-  и копия `docs/reports/final/Афонькин_ИУ9-52Б_Отчёт_о_курсовой_работе.pdf`.
+- Готовый PDF: `docs/explanatory_note/final/Афонькин_ИУ9-52Б_РПЗ.pdf`.
 - Рисунки РПЗ — `docs/explanatory_note/final/figures/` (сгенерированы из
-  `results/*.png`; `emblem.png` — эмблема МГТУ, извлечена со стр. 1
-  `examples/ОБРАЗЕЦ.pdf` с применением SMask); листинги приложений —
+  `results/*.png`; `emblem.png` — эмблема МГТУ); листинги приложений —
   `docs/explanatory_note/final/src/` (копии `achrom/*.py` и `app.py` на момент сборки).
 - По заданию «РПЗ (Отчет по КР)» — один документ, поэтому отчёт и РПЗ
   содержательно совпадают; отдельный короткий «отчёт» в жанре
