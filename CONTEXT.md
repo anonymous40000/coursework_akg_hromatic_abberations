@@ -65,7 +65,7 @@
   реальная латеральная CA: R −8.65px, B +10.91px на краю. Главный тест-кейс.
 - `real_blende8.jpg` — Nikon D90, 2000×1328, JPEG с внутрикамерной коррекцией —
   контроль ложных срабатываний (должно быть «CA < 0.5px, не требует коррекции»).
-- `ICCV2017_RevisitCCIT_code-master/im/blur.png` — дифракционный объектив (KAUST,
+- `blur.png` — дифракционный объектив (KAUST,
   CC BY-NC): продольная CA, латеральный сдвиг ≈0 — пример нерешаемого варпом случая.
 - `lens_ca.jpg` — Wikimedia Commons, «ChromaticAberrationInLens.jpg», Willm2028,
   CC BY-SA 4.0, 2462×2532. Сильная поперечная CA: **R −8.07px, B +14.01px** на краю;
