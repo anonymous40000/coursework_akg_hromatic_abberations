@@ -11,13 +11,36 @@ NCC_THR = 0.75
 MAX_POINTS = 500
 
 
+def estimate_field_shifts(frame_bgr):
+    b, g, r_ch = [c.astype(np.float32) for c in cv2.split(frame_bgr)]
+    h, w = g.shape
+    cx, cy = w / 2, h / 2
+
+    pts, normals = _edge_points(g, cx, cy, h, w, radial_only=False)
+    if len(pts) == 0:
+        z = np.array([])
+        return z, z, z, z, z.astype(bool)
+
+    t = np.arange(-HALF, HALF + 1, dtype=np.float32)
+    lines = pts[:, None, :] + t[None, :, None] * normals[:, None, :]
+    map_x = lines[:, :, 0]
+    map_y = lines[:, :, 1]
+    pg = cv2.remap(g, map_x, map_y, cv2.INTER_LINEAR)
+    pr = cv2.remap(r_ch, map_x, map_y, cv2.INTER_LINEAR)
+    pb = cv2.remap(b, map_x, map_y, cv2.INTER_LINEAR)
+
+    m_red, ok_r = _shift_along_profiles(pg, pr)
+    m_blue, ok_b = _shift_along_profiles(pg, pb)
+    return pts, normals, m_red, m_blue, ok_r & ok_b
+
+
 def estimate_displacements_blind(frame_bgr, center, degree=1):
-    
+
     b, g, r_ch = [c.astype(np.float32) for c in cv2.split(frame_bgr)]
     h, w = g.shape
     cx, cy = center
 
-    pts = _edge_points(g, cx, cy, h, w)
+    pts, _ = _edge_points(g, cx, cy, h, w)
     if len(pts) == 0:
         return np.array([]), np.array([]), np.array([])
 
@@ -46,7 +69,7 @@ def estimate_displacements_blind(frame_bgr, center, degree=1):
     return r, dr_red, dr_blue
 
 
-def _edge_points(g, cx, cy, h, w):
+def _edge_points(g, cx, cy, h, w, radial_only=True):
     gx = cv2.Sobel(g, cv2.CV_32F, 1, 0)
     gy = cv2.Sobel(g, cv2.CV_32F, 0, 1)
     mag = cv2.magnitude(gx, gy)
@@ -58,18 +81,20 @@ def _edge_points(g, cx, cy, h, w):
     ok = (
         (xs > m) & (xs < w - m) & (ys > m) & (ys < h - m) & (r > MIN_R)
     )
-    
-    
+
     gxv, gyv = gx[ys, xs], gy[ys, xs]
-    cos_with_radial = np.abs(
-        (gxv * x + gyv * y) / (np.hypot(gxv, gyv) * r + 1e-9)
-    )
-    ok &= cos_with_radial > 0.7
+    gmag = np.hypot(gxv, gyv)
+    if radial_only:
+        cos_with_radial = np.abs((gxv * x + gyv * y) / (gmag * r + 1e-9))
+        ok &= cos_with_radial > 0.7
+    normals = np.stack([gxv / (gmag + 1e-9), gyv / (gmag + 1e-9)], axis=1)
     pts = np.stack([xs[ok], ys[ok]], axis=1).astype(np.float32)
+    normals = normals[ok]
     if len(pts) > MAX_POINTS:
         sel = np.random.default_rng(0).choice(len(pts), MAX_POINTS, False)
         pts = pts[sel]
-    return pts
+        normals = normals[sel]
+    return pts, normals
 
 
 def _shift_along_profiles(pg, pc):
@@ -84,6 +109,7 @@ def _shift_along_profiles(pg, pc):
 
     peak = scores.argmax(axis=1)
     ok = np.take_along_axis(scores, peak[:, None], 1)[:, 0] > NCC_THR
+    ok &= (peak > 0) & (peak < len(shifts) - 1)
 
     dr = shifts[peak].astype(np.float64)
     left = np.take_along_axis(scores, np.clip(peak - 1, 0, len(shifts) - 1)[:, None], 1)[:, 0]

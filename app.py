@@ -14,9 +14,9 @@ from tkinter import filedialog, messagebox
 import cv2
 import numpy as np
 
-from achrom.blind import estimate_displacements_blind
-from achrom.calibration import fit_radial, radial_model
-from achrom.correction import correct
+from achrom.blind import estimate_field_shifts
+from achrom.calibration import fit_field_model, field_displacement
+from achrom.correction import correct_field, suppress_glare
 
 THUMB_W = 560  
 
@@ -138,43 +138,50 @@ class App:
 
     def _blind_job(self, frame, prefix):
         t_start = time.perf_counter()
-        center = (frame.shape[1] / 2, frame.shape[0] / 2)
         log.info("Слепая коррекция %dx%d", frame.shape[1], frame.shape[0])
         cur = frame
         acc_r = acc_b = 0.0
         n_edges = 0
-        for i in range(3):  
+        corrected = False
+        for i in range(3):
             t0 = time.perf_counter()
-            r, dr_red, dr_blue = estimate_displacements_blind(cur, center)
-            n_edges = len(r)
-            if n_edges == 0:
+            pts, normals, m_red, m_blue, ok = estimate_field_shifts(cur)
+            n_edges = int(ok.sum())
+            if n_edges < 10:
                 raise ValueError("Не найдено достаточно краёв")
-            cr = fit_radial(r, dr_red, degree=1)
-            cb = fit_radial(r, dr_blue, degree=1)
-            rmax = r.max()
-            d_r = radial_model(cr, rmax)
-            d_b = radial_model(cb, rmax)
+            mr = fit_field_model(pts[ok], normals[ok], m_red[ok], cur.shape)
+            mb = fit_field_model(pts[ok], normals[ok], m_blue[ok], cur.shape)
+            h, w = cur.shape[:2]
+            probe = np.array([0, w - 1, 0, w - 1, w / 2], np.float32)
+            probe_y = np.array([0, 0, h - 1, h - 1, h / 2], np.float32)
+            drx, dry = field_displacement(mr, probe, probe_y)
+            dbx, dby = field_displacement(mb, probe, probe_y)
+            d_r = max(np.hypot(drx, dry))
+            d_b = max(np.hypot(dbx, dby))
             log.info("итерация %d: оценка по %d краям за %.1fс "
                      "(сдвиг R %+.2f, B %+.2f)",
                      i + 1, n_edges, time.perf_counter() - t0, d_r, d_b)
-            if max(abs(d_r), abs(d_b)) < 0.5:
+            if max(d_r, d_b) < 0.5:
                 break
             acc_r += d_r
             acc_b += d_b
             t0 = time.perf_counter()
-            cur = correct(cur, center, cr, cb)
+            cur = correct_field(cur, mr, mb)
+            corrected = True
             log.info("итерация %d: варп за %.1fс", i + 1,
                      time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        cur = suppress_glare(cur)
+        log.info("подавление засветки за %.1fс", time.perf_counter() - t0)
         log.info("Слепая коррекция завершена за %.1fс",
                  time.perf_counter() - t_start)
-        unchanged = cur is frame
         status = (
             f"Автокоррекция по {n_edges} краям: сдвиг на краю кадра "
             f"R {acc_r:+.1f}px, B {acc_b:+.1f}px устранён (остаток <0.7px)."
-            if not unchanged else "Снимок не требовал коррекции (CA < 0.5px)."
+            if corrected else "Снимок не требовал коррекции (CA < 0.5px)."
         )
         info = ("Латеральная хроматическая аберрация меньше 0.5px — "
-                "снимок не требует коррекции.") if unchanged else None
+                "снимок не требует коррекции.") if not corrected else None
         diff_path = self._write_outputs(frame, cur, prefix)
         return (frame, cur, diff_path, status, info)
 
@@ -210,21 +217,18 @@ class App:
         self.root.lift()
 
     def _corner_zoom(self, before, after):
-        
         h, w = before.shape[:2]
-        cx, cy = w / 2, h / 2
-        corner = max(
-            [(0, 0), (w, 0), (0, h), (w, h)],
-            key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2,
-        )
-        side = min(h, w) // 3
-        x0 = w - side if corner[0] >= cx else 0
-        y0 = h - side if corner[1] >= cy else 0
+        side = min(h, w, THUMB_W // 2)
+        diff = cv2.absdiff(before, after).sum(2, dtype=np.float32)
+        score = cv2.GaussianBlur(diff, (0, 0), side / 6)
+        _, _, _, (cx, cy) = cv2.minMaxLoc(score)
+        x0 = min(max(cx - side // 2, 0), w - side)
+        y0 = min(max(cy - side // 2, 0), h - side)
         sl = (slice(y0, y0 + side), slice(x0, x0 + side))
 
         def zoom(img):
             return cv2.resize(img[sl], (THUMB_W, THUMB_W),
-                              interpolation=cv2.INTER_LINEAR)
+                              interpolation=cv2.INTER_NEAREST)
 
         return zoom(before), zoom(after)
 
