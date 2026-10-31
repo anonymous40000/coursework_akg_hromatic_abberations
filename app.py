@@ -14,9 +14,14 @@ from tkinter import filedialog, messagebox
 import cv2
 import numpy as np
 
-from achrom.blind import estimate_field_shifts
-from achrom.calibration import fit_field_model, field_displacement
-from achrom.correction import correct_field, suppress_glare
+from achrom.auto import correct_auto, residual
+from achrom.local import local_register
+from achrom.defringe import defringe
+from achrom.correction import suppress_glare
+
+SUPPRESS_GLARE = False
+LOCAL_REGISTER = False
+DEFRINGE = True
 
 THUMB_W = 560  
 
@@ -139,48 +144,49 @@ class App:
     def _blind_job(self, frame, prefix):
         t_start = time.perf_counter()
         log.info("Слепая коррекция %dx%d", frame.shape[1], frame.shape[0])
-        cur = frame
-        acc_r = acc_b = 0.0
-        n_edges = 0
-        corrected = False
-        for i in range(3):
+        cur, rep = correct_auto(frame)
+        log.info("краёв %d, итераций %d, шаги (p95 сдвига по краям) %s, за %.1fс",
+                 rep["edges"], rep["iterations"],
+                 ["%.2f" % x for x in rep["step_rms"]], rep["time"])
+        if rep["edges"] < 10:
+            raise ValueError("Не найдено достаточно краёв")
+        corrected = rep["iterations"] > 0
+        local_changed = 0.0
+        if LOCAL_REGISTER:
             t0 = time.perf_counter()
-            pts, normals, m_red, m_blue, ok = estimate_field_shifts(cur)
-            n_edges = int(ok.sum())
-            if n_edges < 10:
-                raise ValueError("Не найдено достаточно краёв")
-            mr = fit_field_model(pts[ok], normals[ok], m_red[ok], cur.shape)
-            mb = fit_field_model(pts[ok], normals[ok], m_blue[ok], cur.shape)
-            h, w = cur.shape[:2]
-            probe = np.array([0, w - 1, 0, w - 1, w / 2], np.float32)
-            probe_y = np.array([0, 0, h - 1, h - 1, h / 2], np.float32)
-            drx, dry = field_displacement(mr, probe, probe_y)
-            dbx, dby = field_displacement(mb, probe, probe_y)
-            d_r = max(np.hypot(drx, dry))
-            d_b = max(np.hypot(dbx, dby))
-            log.info("итерация %d: оценка по %d краям за %.1fс "
-                     "(сдвиг R %+.2f, B %+.2f)",
-                     i + 1, n_edges, time.perf_counter() - t0, d_r, d_b)
-            if max(d_r, d_b) < 0.5:
-                break
-            acc_r += d_r
-            acc_b += d_b
-            t0 = time.perf_counter()
-            cur = correct_field(cur, mr, mb)
-            corrected = True
-            log.info("итерация %d: варп за %.1fс", i + 1,
+            cur, lrep = local_register(cur)
+            local_changed = lrep["changed"]
+            corrected = corrected or local_changed > 0
+            log.info("локальная регистрация: изменено %.2f%% кадра, пик сдвига B %.1f R %.1f px, "
+                     "за %.1fс", local_changed * 100, lrep["peak"]["b"], lrep["peak"]["r"],
                      time.perf_counter() - t0)
-        t0 = time.perf_counter()
-        cur = suppress_glare(cur)
-        log.info("подавление засветки за %.1fс", time.perf_counter() - t0)
-        log.info("Слепая коррекция завершена за %.1fс",
-                 time.perf_counter() - t_start)
+        fringe_changed = 0.0
+        if DEFRINGE:
+            t0 = time.perf_counter()
+            cur, drep = defringe(cur)
+            fringe_changed = drep["changed"]
+            corrected = corrected or fringe_changed > 0
+            log.info("дефринж: изменено %.2f%% кадра за %.1fс", fringe_changed * 100,
+                     time.perf_counter() - t0)
+        res = residual(cur)
+        log.info("остаток по краям после коррекции (медиана |сдвига|): B %.2f, R %.2f px",
+                 res["b"], res["r"])
+        if SUPPRESS_GLARE:
+            t0 = time.perf_counter()
+            cur = suppress_glare(cur)
+            log.info("подавление засветки за %.1fс", time.perf_counter() - t0)
+        log.info("Слепая коррекция завершена за %.1fс", time.perf_counter() - t_start)
+        ts = rep["total_shift"]
         status = (
-            f"Автокоррекция по {n_edges} краям: сдвиг на краю кадра "
-            f"R {acc_r:+.1f}px, B {acc_b:+.1f}px устранён (остаток <0.7px)."
-            if corrected else "Снимок не требовал коррекции (CA < 0.5px)."
+            f"Автокоррекция по {rep['edges']} краям, {rep['iterations']} ит.: "
+            f"максимальный сдвиг R {ts['r']:.1f}px, B {ts['b']:.1f}px. "
+            f"Повторный замер по краям: остаток R {res['r']:.2f}px, B {res['b']:.2f}px "
+            f"(медиана; ниже ~0.3px — в пределах шума замера). "
+            f"Дефринж (широкая цветная кайма у светлых областей) затронул "
+            f"{fringe_changed * 100:.1f}% кадра, остальное не менялось."
+            if corrected else "Снимок не требовал коррекции (лат. CA в пределах шума замера)."
         )
-        info = ("Латеральная хроматическая аберрация меньше 0.5px — "
+        info = ("Латеральная хроматическая аберрация не обнаружена — "
                 "снимок не требует коррекции.") if not corrected else None
         diff_path = self._write_outputs(frame, cur, prefix)
         return (frame, cur, diff_path, status, info)
