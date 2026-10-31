@@ -24,7 +24,9 @@ def defringe(frame_bgr, reach_frac=REACH_FRAC):
     h, w = frame_bgr.shape[:2]
     f = frame_bgr.astype(np.float32)
     B, G, R = f[..., 0], f[..., 1], f[..., 2]
-    report = {"changed": 0.0, "zone": 0.0}
+    report = {"changed": 0.0, "zone": 0.0, "candidate_pixels": 0, "corrected_pixels": 0,
+              "changed_by_channel": {"b": 0, "g": 0, "r": 0},
+              "mean_abs_delta": {"b": 0.0, "g": 0.0, "r": 0.0}, "method": "directed-fg-bg-evid"}
     fg = ((G >= FG_T) & (R >= G - 25) & (B <= G + 25)).astype(np.uint8)
     if fg.sum() < 100:
         report["time"] = time.perf_counter() - t0
@@ -72,7 +74,7 @@ def defringe(frame_bgr, reach_frac=REACH_FRAC):
     d_b = B - G * (rc + (rf_ - rc) * alpha)
     rc, rf_ = ratio(R, mb), ratio(R, mf)
     d_r = R - G * (rc + (rf_ - rc) * alpha)
-    purple = d_r > np.maximum(PURP_T, 0.6 * d_b)
+    purple = (d_r > np.maximum(PURP_T, 0.35 * d_b)) | (R > G)
     for idx, d, t0_, t1_ in ((0, d_b, TB0, TB1), (2, d_r, TR0, TR1)):
         sign = 1.0 if idx == 0 else -1.0
         m = evid * np.clip((sign * d - T0) / (T1 - T0), 0.0, 1.0)
