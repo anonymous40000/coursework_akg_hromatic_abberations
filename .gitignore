@@ -7,3 +7,5 @@ results/
 *.zip
 data/*_fixed.png
 data/mytestcheck.png
+TECHSPEC.md
+*.docx
