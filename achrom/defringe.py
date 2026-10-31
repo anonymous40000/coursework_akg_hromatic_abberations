@@ -10,6 +10,7 @@ T0, T1 = 22.0, 65.0
 TB0, TB1 = 4.0, 20.0
 TR0, TR1 = 8.0, 36.0
 EV0, EV1 = 8.0, 28.0
+PURP_T = 15.0
 
 
 def defringe(frame_bgr, reach_frac=REACH_FRAC):
@@ -56,18 +57,20 @@ def defringe(frame_bgr, reach_frac=REACH_FRAC):
 
     out = f.copy()
     zone = np.zeros((h, w), np.float32)
-    for idx, C in ((0, B), (2, R)):
-        rc = ratio(C, mb)
-        rf_ = ratio(C, mf)
-        d = C - G * (rc + (rf_ - rc) * alpha)
-        m = evid * np.clip((np.abs(d) - T0) / (T1 - T0), 0.0, 1.0)
-        if idx == 0:
-            sharp = np.clip((d - TB0) / (TB1 - TB0), 0.0, 1.0) * (d > 0)
-        else:
-            sharp = np.clip((-d - TR0) / (TR1 - TR0), 0.0, 1.0) * (d < 0)
+    rc, rf_ = ratio(B, mb), ratio(B, mf)
+    d_b = B - G * (rc + (rf_ - rc) * alpha)
+    rc, rf_ = ratio(R, mb), ratio(R, mf)
+    d_r = R - G * (rc + (rf_ - rc) * alpha)
+    purple = d_r > np.maximum(PURP_T, 0.6 * d_b)
+    for idx, d, t0_, t1_ in ((0, d_b, TB0, TB1), (2, d_r, TR0, TR1)):
+        sign = 1.0 if idx == 0 else -1.0
+        m = evid * np.clip((sign * d - T0) / (T1 - T0), 0.0, 1.0)
+        sharp = np.clip((sign * d - t0_) / (t1_ - t0_), 0.0, 1.0)
         m = np.maximum(m, evid * sharp)
+        if idx == 0:
+            m = m * (~purple)
         m = m * m * (3 - 2 * m) * gates
-        out[..., idx] = C - m * d
+        out[..., idx] = f[..., idx] - m * d
         zone = np.maximum(zone, m)
     res = np.clip(np.rint(out), 0, 255).astype(np.uint8)
     report["changed"] = float((res != frame_bgr).any(axis=2).mean())

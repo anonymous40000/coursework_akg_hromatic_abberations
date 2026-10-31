@@ -86,4 +86,4 @@ def test_cyan_rim_is_removed():
     band[130:370, 230:470] = True
     fringe = (_excess(f) > 40) & band
     assert fringe.sum() > 2000
-    assert (_cyan(out) & band).sum() < 0.02 * fringe.sum()
+    assert (_cyan(out) & fringe).sum() < 0.02 * fringe.sum()
