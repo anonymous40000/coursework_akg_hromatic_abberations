@@ -84,7 +84,17 @@ def defringe(frame_bgr, reach_frac=REACH_FRAC):
         out[..., idx] = f[..., idx] - m * d
         zone = np.maximum(zone, m)
     res = np.clip(np.rint(out), 0, 255).astype(np.uint8)
-    report["changed"] = float((res != frame_bgr).any(axis=2).mean())
+    diff = res != frame_bgr
+    per_channel = diff.reshape(-1, 3).sum(axis=0)
+    report["changed"] = float(diff.any(axis=2).mean())
     report["zone"] = float((zone > 0.05).mean())
+    report["candidate_pixels"] = int((zone > 0.05).sum())
+    report["corrected_pixels"] = int(diff.any(axis=2).sum())
+    report["changed_by_channel"] = {"b": int(per_channel[0]), "g": int(per_channel[1]), "r": int(per_channel[2])}
+    report["mean_abs_delta"] = {
+        name: float(np.abs(res[..., i].astype(np.int16) - frame_bgr[..., i].astype(np.int16)).mean())
+        for i, name in enumerate(("b", "g", "r"))
+    }
+    report["method"] = "directed-fg-bg-evid"
     report["time"] = time.perf_counter() - t0
     return res, report

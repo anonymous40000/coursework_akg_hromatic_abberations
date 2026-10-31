@@ -1,57 +1,65 @@
 import cv2
 import numpy as np
+import pytest
 
 from achrom.auto import correct_auto, residual
-from achrom.synthetic import apply_radial_shift
+from achrom.synthetic import make_dot_frame
 
 
-def _scene(shape=(500, 700), seed=3):
-    rng = np.random.default_rng(seed)
-    base = np.zeros(shape, np.float32)
-    for _ in range(140):
-        x, y = rng.integers(40, shape[1] - 40), rng.integers(40, shape[0] - 40)
-        a, b = rng.integers(10, 50, 2)
-        cv2.ellipse(base, (int(x), int(y)), (int(a), int(b)), float(rng.integers(0, 180)),
-                    0, 360, float(rng.integers(40, 255)), -1)
-    base = cv2.GaussianBlur(base, (0, 0), 1.2)
-    return np.clip(base, 0, 255).astype(np.uint8)
+def test_auto_registration_removes_known_lateral_ca():
+    source, _ = make_dot_frame(
+        shape=(500, 500),
+        k_blue=0.035,
+        k_red=-0.028,
+    )
+    before = residual(source)
+    corrected, report = correct_auto(source)
+    after = residual(corrected)
+
+    assert report["applied"] is True
+    assert report["iterations"] >= 1
+    assert after["b"] < before["b"] * 0.10
+    assert after["r"] < before["r"] * 0.10
+    assert after["b_p95"] < before["b_p95"] * 0.20
+    assert after["r_p95"] < before["r_p95"] * 0.20
 
 
-def _aberrated(k_red, k_blue):
-    g = _scene()
-    center = (g.shape[1] / 2, g.shape[0] / 2)
-    frame = cv2.merge([apply_radial_shift(g, center, k_blue), g,
-                       apply_radial_shift(g, center, k_red)])
-    return frame, g
+def test_auto_registration_is_identity_without_ca():
+    source, _ = make_dot_frame(shape=(500, 500), k_blue=0.0, k_red=0.0)
+    corrected, report = correct_auto(source)
+
+    assert np.array_equal(corrected, source)
+    assert report["applied"] is False
+    assert report["iterations"] == 0
+    assert report["converged"] is True
 
 
-def _mae(a, b, m=30):
-    return float(np.abs(a[m:-m, m:-m].astype(np.float32) - b[m:-m, m:-m].astype(np.float32)).mean())
+def test_residual_exposes_support_and_tail_metrics():
+    source, _ = make_dot_frame(shape=(500, 500), k_blue=0.02, k_red=-0.02)
+    result = residual(source)
+
+    for channel in ("b", "r"):
+        assert result[channel + "_n"] > 0
+        assert 0.0 < result[channel + "_support"] <= 1.0
+        assert result[channel + "_p95"] >= result[channel + "_p90"]
+        assert result[channel + "_p90"] >= result[channel]
 
 
-def test_known_aberration_is_removed():
-    frame, g = _aberrated(0.012, -0.018)
-    out, rep = correct_auto(frame)
-    before = max(_mae(frame[..., 0], g), _mae(frame[..., 2], g))
-    after = max(_mae(out[..., 0], g), _mae(out[..., 2], g))
-    assert after < 0.25 * before, (before, after)
+def test_auto_rejects_invalid_input():
+    with pytest.raises(ValueError):
+        correct_auto(np.zeros((100, 100), dtype=np.uint8))
+    with pytest.raises(TypeError):
+        correct_auto(np.zeros((100, 100, 3), dtype=np.float32))
+    with pytest.raises(ValueError):
+        correct_auto(np.zeros((64, 64, 3), dtype=np.uint8))
 
 
-def test_clean_image_is_untouched():
-    g = _scene()
-    frame = cv2.merge([g, g, g])
-    out, rep = correct_auto(frame)
-    assert rep["iterations"] == 0
-    assert np.array_equal(out, frame)
+def test_flat_image_is_not_modified_or_reported_as_converged():
+    source = np.full((192, 192, 3), 128, dtype=np.uint8)
+    corrected, report = correct_auto(source)
 
-
-def test_green_channel_never_modified():
-    frame, _ = _aberrated(0.012, -0.018)
-    out, _ = correct_auto(frame)
-    assert np.array_equal(out[..., 1], frame[..., 1])
-
-
-def test_residual_drops_after_correction():
-    frame, _ = _aberrated(0.012, -0.018)
-    out, _ = correct_auto(frame)
-    assert residual(out)["b"] < residual(frame, s_max=24)["b"]
+    assert np.array_equal(corrected, source)
+    assert report["applied"] is False
+    assert report["converged"] is False
+    assert report["stop_reason"] == "insufficient_edges"
+    assert report["edges"] == 0

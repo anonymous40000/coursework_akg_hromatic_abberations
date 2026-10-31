@@ -214,9 +214,7 @@
 - Направление родика источника юбки у дуги НЕВЕРНО определяется ∇dist
   (ближайший геометрически ≠ фактический источник юбки).
 
-## defringe v2.2 — карманный эрозионный evid (31.10.2026)
-
-Решение диагностики выше: evid остаётся комбинированным.
+## defringe v2.2 — карманный эрозионный evid (31.10.2026)Решение диагностики выше: evid остаётся комбинированным.
 - `ev_ray` (основной, как в v2.1): remap на reach/3 вдоль ∇dist — защищает небо
   (плато B) и обычные каемки у краёв.
 - `ev_min` (новый): локальный минимум B — эрозия эллипсом K_MIN=121 (на ds=4)
@@ -238,3 +236,43 @@
 - Отвергнуто при разработке: чистый erode-evid (ломает небо holga при любых порогах
   EV 8/28 или 30/60), G-гейт по всему кадру (убивает коррекцию вокруг ярких лепестков,
   там G 130-200), rf-cap (не влияет на хвосты).
+
+## Слияние с внешним рефакторингом — v2.3 (31.10.2026, поздно вечером)
+
+В `../coursework_refactored/` пришёл рефакторинг (та же кодовая база, изменены
+auto.py/defringe.py/app.py + новые pipeline.py/__init__.py). Его defringe
+(«local-edge-colour-line»: интерполяция цвета между двумя точками края лумы)
+оказался сверхконсервативным: detail_ca циан 54101→53373 (убрано 1%), хвосты
+97352 px (в 46 раз хуже v2.2), контрольный mytestcheck тронут на 189340 px
+(пурпурные цветы!); регрессия — он выброшен, сохранён наш v2.2.
+
+Принято из рефакторинга (модули остального байт-в-байт совпадали):
+- `achrom/auto.py` (316→507 строк): валидация геометрической модели повторным
+  измерением перед применением (нет улучшения → кандидат отбрасывается),
+  backtracking по масштабу коррекции (accepted_factor), исправлен normal-bias
+  (раньше участвовал в подгонке, но не входил в поле варпинга), отчёт:
+  applied/converged/stop_reason/total_shift/verified_residual. На контрольном
+  mytestcheck r-сдвиг стал 1.54px против 4.01 у старого (аккуратнее на кадре
+  без CA); на holga total_shift b=0.83px (было ~7).
+- `achrom/pipeline.py`: `process_frame(frame_bgr, enable_defringe, return_stages)`
+  — единая точка входа: residual до/после геометрии (не после defringe — цветовая
+  правка не должна маскироваться под регистрацию), стадии source/geometry/final.
+- `app.py`: тот же каркас (_run_job воркер + _poll_pending через root.after,
+  log_errors, _root_alive, TK_SILENCE_DEPRECATION до tkinter), но результаты
+  пишутся как {имя}_before/_geometry/_after/_compare.png, открытие сравнения
+  через системный просмотрщик, Unicode-пути, чекбокс defringe.
+- `tests/test_auto.py` переписан под новый отчёт; `tests/test_pipeline.py` новый
+  (method переименован в «directed-fg-bg-evid»); `pytest.ini` (pythonpath=.),
+  `requirements.txt`. Итог: 42 теста зелёные.
+
+Отчёт defringe расширен ключами для pipeline/app: candidate_pixels,
+corrected_pixels, changed_by_channel, mean_abs_delta, method
+(«directed-fg-bg-evid»); сигнатура defringe(frame_bgr, reach_frac) совместима
+с вызовом из pipeline позиционно.
+
+Метрики слитого конвейера (process_frame, полный пайплайн): detail_ca
+циан 54101→12266, хвосты 2121, кольца 0-6px = 0 (идентично v2.2, геометрия
+не применяется); holga changed 5.03%, контроли неба Δдефринджа 0-3; blende8
+1.83%; lens_ca 5.83%; mytestcheck defringe 0.00%, пурпур (1637,500) цел
+после дефринджа. Артефакты results/{name}_before/after/diff.png,
+COMPARE_defringe.png, DEFRINGE_BEFORE_AFTER.png перегенерированы.
