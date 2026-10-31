@@ -87,3 +87,36 @@ def test_cyan_rim_is_removed():
     fringe = (_excess(f) > 40) & band
     assert fringe.sum() > 2000
     assert (_cyan(out) & fringe).sum() < 0.02 * fringe.sum()
+
+
+def _gap_scene():
+    h, w = 512, 960
+    f = np.empty((h, w, 3), np.float32)
+    f[..., 1], f[..., 2], f[..., 0] = 65.0, 60.0, 55.0
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    disk, skirt = np.zeros_like(yy), np.zeros_like(yy)
+    for cx, cy in ((300.0, 220.0), (620.0, 220.0)):
+        d = np.hypot(xx - cx, yy - cy)
+        disk = np.maximum(disk, cv2.GaussianBlur((d < 110).astype(np.float32), (0, 0), 3))
+        skirt = np.maximum(skirt, np.exp(-0.5 * (np.maximum(d - 110.0, 0) / 60.0) ** 2))
+    f[..., 0] += 150.0 * skirt
+    f[..., 0] = np.maximum(f[..., 0], 235.0 * disk)
+    f[..., 1] = np.maximum(f[..., 1], 235.0 * disk)
+    f[..., 2] = np.maximum(f[..., 2], 230.0 * disk)
+    wedge = np.zeros((h, w), np.float32)
+    tri = np.array([[(460, 240), (410, 512), (510, 512)]], np.int32)
+    cv2.fillPoly(wedge, [tri], 1.0)
+    for i in range(3):
+        f[..., i] = f[..., i] * (1 - wedge) + 50.0 * wedge
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
+def test_gap_skirt_between_two_bright_plates_is_removed():
+    f = _gap_scene()
+    gap = np.zeros(f.shape[:2], bool)
+    gap[178:270, 420:500] = True
+    before = (f[:, :, 0].astype(int) - f[:, :, 1].astype(int) > 20) & gap
+    assert before.sum() > 3000
+    out, _ = defringe(f, reach_frac=0.25)
+    after = (out[:, :, 0].astype(int) - out[:, :, 1].astype(int) > 20) & gap
+    assert after.sum() < 0.05 * before.sum()

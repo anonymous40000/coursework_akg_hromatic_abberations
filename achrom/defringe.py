@@ -11,6 +11,12 @@ TB0, TB1 = 4.0, 20.0
 TR0, TR1 = 8.0, 36.0
 EV0, EV1 = 8.0, 28.0
 PURP_T = 15.0
+K_MIN = 121.0
+
+
+def _ell(k):
+    k = max(3, int(k) | 1)
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
 
 def defringe(frame_bgr, reach_frac=REACH_FRAC):
@@ -53,7 +59,12 @@ def defringe(frame_bgr, reach_frac=REACH_FRAC):
     step = reach / 3.0
     b_far = cv2.remap(B, xs + step * (gx / gn), ys + step * (gy / gn),
                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    evid = np.clip((B - b_far - EV0) / (EV1 - EV0), 0.0, 1.0)
+    ev_ray = np.clip((B - b_far - EV0) / (EV1 - EV0), 0.0, 1.0)
+    b_low = cv2.resize(cv2.erode(cv2.resize(B, (w // 4, h // 4), interpolation=cv2.INTER_AREA),
+                                 _ell(K_MIN / 4)), (w, h), interpolation=cv2.INTER_LINEAR)
+    ev_min = np.clip((B - b_low - EV0) / (EV1 - EV0), 0.0, 1.0)
+    pocket = np.clip((80.0 - dist_bg) / 30.0, 0.0, 1.0) * np.clip((100.0 - G) / 25.0, 0.0, 1.0)
+    evid = np.maximum(ev_ray, ev_min * pocket)
 
     out = f.copy()
     zone = np.zeros((h, w), np.float32)
