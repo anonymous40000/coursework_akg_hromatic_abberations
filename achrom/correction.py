@@ -79,9 +79,7 @@ def _warp_back(channel, center, coeffs):
     dx, dy = xs - cx, ys - cy
     r = np.hypot(dx, dy)
 
-    s = r.copy()
-    for _ in range(3):
-        s = r + radial_model(coeffs, s)
+    s = r + radial_model(coeffs, r)
 
     scale = np.where(r == 0, 1.0, s / np.where(r == 0, 1.0, r))
     map_x = (cx + dx * scale).astype(np.float32)

@@ -1,10 +1,13 @@
-
 import functools
 import logging
 import os
+import queue
+import re
 import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -14,11 +17,10 @@ from tkinter import filedialog, messagebox
 import cv2
 import numpy as np
 
-from achrom.blind import estimate_displacements_blind
-from achrom.calibration import fit_radial, radial_model
-from achrom.correction import correct
+from achrom.axial import effective_sigma as measure_sigma, measure_axial_kernels
+from achrom.pipeline import process_frame
 
-THUMB_W = 560  
+RESULTS_DIR = Path("results")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,224 +32,398 @@ logging.basicConfig(
 )
 log = logging.getLogger("achrom.app")
 
-
-def log_errors(fn):
-    
-    @functools.wraps(fn)
+def log_errors(function):
+    @functools.wraps(function)
     def wrapper(*args, **kwargs):
         try:
-            return fn(*args, **kwargs)
+            return function(*args, **kwargs)
         except KeyboardInterrupt:
-            log.info("%s прервано пользователем (Ctrl+C)", fn.__name__)
-            return
-        except Exception:
-            log.exception("Сбой в %s", fn.__name__)
-            if not args or not getattr(args[0], "_root_alive", lambda: True)():
-                return  
-            try:
+            log.info("%s прервано пользователем", function.__name__)
+            return None
+        except Exception as error:
+            log.exception("Сбой в %s", function.__name__)
+            if args and getattr(args[0], "_root_alive", lambda: False)():
                 messagebox.showerror(
                     "Ошибка",
-                    f"Сбой в «{fn.__name__}». Подробности — в app.log",
+                    "Не удалось выполнить операцию. Подробности записаны в app.log.",
+                    parent=args[0].root,
                 )
-            except Exception:
-                pass
+            return None
     return wrapper
-
 
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Коррекция хроматических аберраций")
-        self.fixed_frame = None
+        self.root.title("Коррекция хроматических аберраций")
+        self.root.minsize(560, 170)
         self._busy = False
-        self._pending = None
+        self._closing = False
+        self._result_queue = queue.Queue(maxsize=1)
         self._last_stem = "result"
+        self._buttons = []
 
-        bar = tk.Frame(root)
-        bar.pack(fill=tk.X, padx=4, pady=4)
-        self._buttons = [
-            tk.Button(bar, text="Загрузить снимок", command=self.load_photo)
-        ]
-        self._buttons[0].pack(side=tk.LEFT, padx=3)
+        toolbar = tk.Frame(root)
+        toolbar.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        load_button = tk.Button(
+            toolbar,
+            text="Загрузить снимок",
+            command=self.load_photo,
+            width=20,
+        )
+        load_button.pack(side=tk.LEFT, padx=(0, 8))
+        self._buttons.append(load_button)
+
+        self.defringe_var = tk.BooleanVar(value=True)
+        cleanup_toggle = tk.Checkbutton(
+            toolbar,
+            text="Мягкое удаление остаточных цветных ореолов",
+            variable=self.defringe_var,
+            anchor="w",
+        )
+        cleanup_toggle.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.axial_var = tk.BooleanVar(value=False)
+        axial_toggle = tk.Checkbutton(
+            toolbar,
+            text="Компенсация продольной аберрации",
+            variable=self.axial_var,
+            anchor="w",
+        )
+        axial_toggle.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.status = tk.Label(
-            root, text="Загрузите снимок — коррекция выполнится автоматически.\n"
-                       "Результат «до/после» откроется в системном просмотрщике.",
-            anchor="w", justify=tk.LEFT,
+            root,
+            text=(
+                "Выберите изображение. Сначала выполняется геометрическое "
+                "совмещение каналов, затем — необязательная локальная "
+                "коррекция цветных ореолов."
+            ),
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=760,
         )
-        self.status.pack(fill=tk.X, padx=6, pady=4)
+        self.status.pack(fill=tk.X, padx=10, pady=8)
 
-    
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        log.info("GUI инициализирован")
 
     def _root_alive(self):
+        if self._closing:
+            return False
         try:
             return bool(self.root.winfo_exists())
         except tk.TclError:
             return False
 
+    def _on_close(self):
+        self._closing = True
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
     def _run_job(self, job):
-        
-        if self._busy:
+        if self._busy or not self._root_alive():
             return
         self._busy = True
-        self._pending = None
-        for b in self._buttons:
-            b.config(state=tk.DISABLED)
-        self.status.config(text="Обработка… окно отвечает, подождите пару секунд")
+        while True:
+            try:
+                self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+        for button in self._buttons:
+            button.config(state=tk.DISABLED)
+        self.status.config(text="Обработка… интерфейс остаётся отзывчивым.")
 
         def worker():
+            started = time.perf_counter()
             try:
-                self._pending = (True, job())
-            except Exception:
-                log.exception("Сбой фоновой обработки")
-                self._pending = (False, None)
+                result = job()
+                self._result_queue.put((True, result))
+            except Exception as error:
+                log.exception("Ошибка фоновой обработки")
+                self._result_queue.put((False, error))
+            finally:
+                log.info("Фоновая задача завершилась за %.2fс", time.perf_counter() - started)
 
-        threading.Thread(target=worker, daemon=True, name="proc").start()
+        threading.Thread(target=worker, daemon=True, name="achrom-worker").start()
         self.root.after(100, self._poll_pending)
 
     def _poll_pending(self):
-        if self._pending is None:
+        if not self._root_alive():
+            return
+        try:
+            ok, result = self._result_queue.get_nowait()
+        except queue.Empty:
             self.root.after(100, self._poll_pending)
             return
-        ok, res = self._pending
-        self._pending = None
-        self._busy = False
-        for b in self._buttons:
-            b.config(state=tk.NORMAL)
-        if ok:
-            try:
-                self._display(*res)
-            except Exception:
-                log.exception("Сбой при показе результата — "
-                              "файлы уже сохранены на диске")
-        else:
-            messagebox.showerror(
-                "Ошибка", "Сбой при обработке. Подробности — в app.log")
 
-    
+        self._busy = False
+        for button in self._buttons:
+            button.config(state=tk.NORMAL)
+
+        if not ok:
+            messagebox.showerror(
+                "Ошибка обработки",
+                "Обработка не завершилась. Подробности записаны в app.log.",
+                parent=self.root,
+            )
+            self.status.config(text="Обработка завершилась с ошибкой. См. app.log.")
+            return
+
+        try:
+            self._display(*result)
+        except Exception:
+            log.exception("Не удалось показать результат; файлы уже сохранены")
+            self.status.config(text="Файлы сохранены, но открыть просмотр не удалось.")
 
     @log_errors
     def load_photo(self):
-        frame = self._open_image()
-        if frame is None:
-            return
-        stem = self._last_stem
-        self._run_job(lambda: self._blind_job(frame, stem))
-
-    
-
-    def _blind_job(self, frame, prefix):
-        t_start = time.perf_counter()
-        center = (frame.shape[1] / 2, frame.shape[0] / 2)
-        log.info("Слепая коррекция %dx%d", frame.shape[1], frame.shape[0])
-        cur = frame
-        acc_r = acc_b = 0.0
-        n_edges = 0
-        for i in range(3):  
-            t0 = time.perf_counter()
-            r, dr_red, dr_blue = estimate_displacements_blind(cur, center)
-            n_edges = len(r)
-            if n_edges == 0:
-                raise ValueError("Не найдено достаточно краёв")
-            cr = fit_radial(r, dr_red, degree=1)
-            cb = fit_radial(r, dr_blue, degree=1)
-            rmax = r.max()
-            d_r = radial_model(cr, rmax)
-            d_b = radial_model(cb, rmax)
-            log.info("итерация %d: оценка по %d краям за %.1fс "
-                     "(сдвиг R %+.2f, B %+.2f)",
-                     i + 1, n_edges, time.perf_counter() - t0, d_r, d_b)
-            if max(abs(d_r), abs(d_b)) < 0.5:
-                break
-            acc_r += d_r
-            acc_b += d_b
-            t0 = time.perf_counter()
-            cur = correct(cur, center, cr, cb)
-            log.info("итерация %d: варп за %.1fс", i + 1,
-                     time.perf_counter() - t0)
-        log.info("Слепая коррекция завершена за %.1fс",
-                 time.perf_counter() - t_start)
-        unchanged = cur is frame
-        status = (
-            f"Автокоррекция по {n_edges} краям: сдвиг на краю кадра "
-            f"R {acc_r:+.1f}px, B {acc_b:+.1f}px устранён (остаток <0.7px)."
-            if not unchanged else "Снимок не требовал коррекции (CA < 0.5px)."
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Выберите изображение",
+            filetypes=[
+                ("Изображения", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp"),
+                ("Все файлы", "*.*"),
+            ],
         )
-        info = ("Латеральная хроматическая аберрация меньше 0.5px — "
-                "снимок не требует коррекции.") if unchanged else None
-        diff_path = self._write_outputs(frame, cur, prefix)
-        return (frame, cur, diff_path, status, info)
-
-    def _write_outputs(self, before, after, prefix):
-        
-        t0 = time.perf_counter()
-        out = os.path.join("results", prefix)
-        os.makedirs("results", exist_ok=True)
-        cv2.imwrite(f"{out}_before.png", before)
-        cv2.imwrite(f"{out}_after.png", after)
-        zb, za = self._corner_zoom(before, after)
-        cv2.imwrite(f"{out}_diff.png", np.hstack([zb, za]))
-        log.info("PNG-файлы записаны за %.1fс", time.perf_counter() - t0)
-        return f"{out}_diff.png"
-
-    
-
-    def _display(self, before, after, diff_path, status, info):
-        self.fixed_frame = after
-        stem = os.path.basename(diff_path).replace("_diff.png", "")
-        out_dir = os.path.dirname(os.path.abspath(diff_path))
-        self.status.config(
-            text=f"{status}\nРезультаты в папке {out_dir}: "
-                 f"{stem}_before.png, {stem}_after.png, {stem}_diff.png")
-        
-        try:
-            subprocess.run(["open", diff_path], check=False)
-            log.info("_display: открыт в просмотрщике %s", diff_path)
-        except OSError:
-            log.warning("_display: не удалось открыть просмотрщик")
-        if info:
-            messagebox.showinfo("CA не обнаружена", info)
-        self.root.lift()
-
-    def _corner_zoom(self, before, after):
-        
-        h, w = before.shape[:2]
-        cx, cy = w / 2, h / 2
-        corner = max(
-            [(0, 0), (w, 0), (0, h), (w, h)],
-            key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2,
-        )
-        side = min(h, w) // 3
-        x0 = w - side if corner[0] >= cx else 0
-        y0 = h - side if corner[1] >= cy else 0
-        sl = (slice(y0, y0 + side), slice(x0, x0 + side))
-
-        def zoom(img):
-            return cv2.resize(img[sl], (THUMB_W, THUMB_W),
-                              interpolation=cv2.INTER_LINEAR)
-
-        return zoom(before), zoom(after)
-
-    
-
-    def _open_image(self):
-        path = filedialog.askopenfilename()
         if not path:
-            return None
-        frame = cv2.imread(path, cv2.IMREAD_COLOR)
-        if frame is None:
-            log.warning("Не удалось прочитать изображение: %s", path)
-            messagebox.showerror("Ошибка", "Не удалось открыть изображение")
-        else:
-            stem = os.path.splitext(os.path.basename(path))[0]
-            self._last_stem = stem or "result"
-            log.info("Загружено %s (%dx%d)", path,
-                     frame.shape[1], frame.shape[0])
-        return frame
+            return
 
+        frame = self._read_image(path)
+        if frame is None:
+            messagebox.showerror(
+                "Ошибка",
+                "Не удалось прочитать изображение или формат не поддерживается.",
+                parent=self.root,
+            )
+            return
+
+        stem = self._safe_stem(Path(path).stem)
+        self._last_stem = stem
+        cleanup_enabled = bool(self.defringe_var.get())
+        axial_enabled = bool(self.axial_var.get())
+        log.info("Загружено %s (%dx%d)", path, frame.shape[1], frame.shape[0])
+        self._run_job(lambda: self._process_job(frame, stem, cleanup_enabled, axial_enabled))
+
+    @staticmethod
+    def _read_image(path):
+        try:
+            encoded = np.fromfile(path, dtype=np.uint8)
+            if encoded.size == 0:
+                return None
+            return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        except (OSError, ValueError, cv2.error):
+            log.exception("Не удалось прочитать файл %s", path)
+            return None
+
+    @staticmethod
+    def _safe_stem(stem):
+        value = re.sub(r"[^\w.-]+", "_", stem, flags=re.UNICODE).strip("._")
+        return value[:100] or "result"
+
+    def _process_job(self, frame, prefix, cleanup_enabled, axial_enabled=False):
+        started = time.perf_counter()
+        log.info(
+            "Начата обработка %dx%d; defringe=%s; axial=%s",
+            frame.shape[1], frame.shape[0], cleanup_enabled, axial_enabled,
+        )
+        final_image, report, stages = process_frame(
+            frame,
+            enable_defringe=cleanup_enabled,
+            enable_axial=axial_enabled,
+            return_stages=True,
+        )
+        if axial_enabled and report.get("axial"):
+            log.info(
+                "Продольная аберрация: sigma B=%.2f R=%.2f, время=%.2fс",
+                report["axial"]["sigma"]["b"], report["axial"]["sigma"]["r"],
+                report["axial"]["time"],
+            )
+        geometry = report["geometry"]
+        before = report["residual_before_geometry"]
+        after = report["residual_after_geometry"]
+        fringe = report["defringe"]
+
+        log.info(
+            "Геометрия: краёв=%d, итераций=%d, сдвиг peak B=%.3f R=%.3f px, "
+            "support B=%.1f%% R=%.1f%%, время=%.2fс",
+            geometry["edges"], geometry["iterations"],
+            geometry["total_shift"]["b"], geometry["total_shift"]["r"],
+            geometry["support"]["b"] * 100, geometry["support"]["r"] * 100,
+            geometry["time"],
+        )
+        log.info(
+            "Остаток геометрии B median/p95 %.3f/%.3f px -> %.3f/%.3f px; "
+            "R %.3f/%.3f px -> %.3f/%.3f px",
+            before["b"], before["b_p95"], after["b"], after["b_p95"],
+            before["r"], before["r_p95"], after["r"], after["r_p95"],
+        )
+        log.info(
+            "Дефринж: кандидатов=%d, исправлено пикселей=%d (%.3f%%), "
+            "B/G/R=%s, время=%.2fс",
+            fringe["candidate_pixels"], fringe["corrected_pixels"],
+            fringe["changed"] * 100,
+            fringe["changed_by_channel"], fringe["time"],
+        )
+
+        paths = self._write_outputs(prefix, stages, report)
+        status = self._format_status(report, paths["directory"])
+        log.info("Обработка %s завершена за %.2fс", prefix, time.perf_counter() - started)
+        return stages["source"], stages["geometry"], final_image, paths, status
+
+    def _write_outputs(self, prefix, stages, report):
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "after": RESULTS_DIR / (prefix + ".png"),
+            "directory": str(RESULTS_DIR.resolve()),
+        }
+        self._write_image(paths["after"], stages["final"])
+        log.info("Результат сохранён: %s", paths["after"])
+        return paths
+
+    @staticmethod
+    def _write_image(path, image):
+        ok, encoded = cv2.imencode(path.suffix, image)
+        if not ok:
+            raise OSError("OpenCV не смог закодировать изображение: %s" % path)
+        encoded.tofile(str(path))
+
+    @staticmethod
+    def _format_metric(residual, channel, percentile):
+        value = residual.get(channel + percentile, float("nan"))
+        if not np.isfinite(value):
+            return "н/д"
+        return "%.2f" % value
+
+    def _format_status(self, report, output_directory):
+        geometry = report["geometry"]
+        before = report["residual_before_geometry"]
+        after = report["residual_after_geometry"]
+        fringe = report["defringe"]
+        shifts = geometry["total_shift"]
+        return (
+            "Геометрия: {iterations} ит., максимум B {blue:.2f}px / R {red:.2f}px.\n"
+            "Остаток B median/p95: {b0}/{b1} → {b2}/{b3}px; "
+            "R median/p95: {r0}/{r1} → {r2}/{r3}px.\n"
+            "Надёжные края: B {sb:.0f}%, R {sr:.0f}%. Дефринж: "
+            "{changed:.3f}% пикселей; подтверждённых кандидатов {candidates}.\n"
+            "Файлы сохранены в {directory}."
+        ).format(
+            iterations=geometry["iterations"], blue=shifts["b"], red=shifts["r"],
+            b0=self._format_metric(before, "b", ""),
+            b1=self._format_metric(before, "b", "_p95"),
+            b2=self._format_metric(after, "b", ""),
+            b3=self._format_metric(after, "b", "_p95"),
+            r0=self._format_metric(before, "r", ""),
+            r1=self._format_metric(before, "r", "_p95"),
+            r2=self._format_metric(after, "r", ""),
+            r3=self._format_metric(after, "r", "_p95"),
+            sb=geometry["support"]["b"] * 100,
+            sr=geometry["support"]["r"] * 100,
+            changed=fringe["changed"] * 100,
+            candidates=fringe["candidate_pixels"],
+            directory=output_directory,
+        )
+
+    def _display(self, before, geometry, after, paths, status):
+        self.status.config(text=status, wraplength=900)
+        log.info("Открытие результата %s", paths["after"])
+        self._open_preview(paths["after"])
+
+    @staticmethod
+    def _open_preview(path):
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            elif os.name == "nt":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(
+                    ["xdg-open", str(path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except OSError:
+            log.exception("Не удалось открыть системный просмотрщик")
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+def _collect_cli_paths(args):
+    paths = []
+    for arg in args:
+        p = Path(arg)
+        if p.is_dir():
+            found = sorted(q for q in p.iterdir() if q.suffix.lower() in IMAGE_EXTENSIONS)
+            if not found:
+                log.warning("Каталог %s не содержит изображений", p)
+            paths.extend(found)
+        else:
+            paths.append(p)
+    return paths
+
+def _run_cli(args):
+    axial = "--axial" in args
+    args = [arg for arg in args if arg != "--axial"]
+    axial_kernels = None
+    if "--axial-cal" in args:
+        index = args.index("--axial-cal")
+        if index + 1 >= len(args):
+            print("Укажите путь к калибровочному кадру после --axial-cal")
+            return 2
+        cal_path = args[index + 1]
+        del args[index:index + 2]
+        cal_frame = App._read_image(cal_path)
+        if cal_frame is None:
+            print(f"Не удалось прочитать калибровочный кадр {cal_path}")
+            return 2
+        try:
+            kernel_b, kernel_r = measure_axial_kernels(cal_frame)
+        except (TypeError, ValueError) as error:
+            print(f"Кадр {cal_path} не подходит для калибровки: {error}")
+            return 2
+        axial_kernels = (kernel_b, kernel_r)
+        axial = True
+        print(
+            "Калибровка продольной аберрации: sigma B="
+            f"{measure_sigma(kernel_b):.2f} R={measure_sigma(kernel_r):.2f} px"
+        )
+    paths = _collect_cli_paths(args)
+    if not paths:
+        print(
+            "Использование: python app.py [--axial | --axial-cal <мишень>] "
+            "<фото или каталог> [...] (без аргументов — GUI)"
+        )
+        return 2
+    shim = App.__new__(App)
+    failures = 0
+    for i, path in enumerate(paths, 1):
+        frame = App._read_image(path)
+        if frame is None:
+            log.error("[%d/%d] Пропуск %s: не удалось прочитать", i, len(paths), path)
+            failures += 1
+            continue
+        stem = App._safe_stem(Path(path).stem)
+        log.info("[%d/%d] Обработка %s (%dx%d)", i, len(paths), path, frame.shape[1], frame.shape[0])
+        try:
+            final, report, stages = process_frame(
+                frame, enable_axial=axial, axial_kernels=axial_kernels,
+                return_stages=True,
+            )
+            out = shim._write_outputs(stem, stages, report)
+            print(f"[{i}/{len(paths)}] {path} -> {out['after']}")
+            print("  " + shim._format_status(report, out["directory"]).replace("\n", "\n  "))
+        except Exception:
+            log.exception("[%d/%d] Ошибка обработки %s", i, len(paths), path)
+            failures += 1
+    return 1 if failures else 0
 
 if __name__ == "__main__":
     try:
+        if len(sys.argv) > 1:
+            log.info("Старт CLI: %d аргумент(ов)", len(sys.argv) - 1)
+            raise SystemExit(_run_cli(sys.argv[1:]))
         log.info("Старт приложения")
         root = tk.Tk()
         App(root)
@@ -255,7 +431,6 @@ if __name__ == "__main__":
         log.info("Успешный выход")
     except KeyboardInterrupt:
         log.info("Выход по Ctrl+C")
-        print("\nУспешный выход")
     except Exception:
         log.exception("Критический сбой приложения")
         raise

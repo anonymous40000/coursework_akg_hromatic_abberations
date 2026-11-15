@@ -63,3 +63,22 @@ def test_flat_image_is_not_modified_or_reported_as_converged():
     assert report["converged"] is False
     assert report["stop_reason"] == "insufficient_edges"
     assert report["edges"] == 0
+
+
+def test_constant_shift_is_undone_at_frame_edges():
+    from achrom.synthetic import make_texture_frame
+
+    texture = cv2.GaussianBlur(make_texture_frame((480, 520), seed=7), (0, 0), 1.2)
+    matrix = np.float32([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0]])
+    blue = cv2.warpAffine(
+        texture, matrix, (520, 480),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+    )
+    source = cv2.merge([blue, texture, texture])
+
+    corrected, report = correct_auto(source)
+
+    assert report["applied"] is True
+    diff = np.abs(corrected[:, :, 0].astype(np.int16) - corrected[:, :, 1].astype(np.int16))
+    assert float(diff[:, 100:420].mean()) < 0.3
+    assert float(diff[:, -12:-2].mean()) < 0.3

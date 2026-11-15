@@ -9,3 +9,13 @@ data/*_fixed.png
 data/mytestcheck.png
 TECHSPEC.md
 *.docx
+
+# LaTeX artifacts
+*.aux
+*.log
+*.toc
+*.out
+*.synctex.gz
+
+# личные материалы к защите
+docs/defense/

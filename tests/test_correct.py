@@ -26,3 +26,13 @@ def test_corrected_frame_channels_align():
     fixed = correct(test_frame, center2, coeffs_red, coeffs_blue)
     assert residual(fixed, center2) < 0.3      
 
+
+
+def test_correction_uses_forward_radius_model():
+    frame, center = make_dot_frame(
+        shape=(1000, 1000), k_red=0.04, k_blue=-0.03,
+    )
+    coeffs_red, coeffs_blue = calibrate(frame, center)
+    fixed = correct(frame, center, coeffs_red, coeffs_blue)
+
+    assert residual(fixed, center) < 0.2

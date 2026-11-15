@@ -6,12 +6,15 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .auto import correct_auto, residual
+from .axial import correct_axial
 from .defringe import defringe
 
 def process_frame(
     frame_bgr: np.ndarray,
     enable_defringe: bool = True,
     return_stages: bool = False,
+    enable_axial: bool = False,
+    axial_kernels=None,
 ):
     started = time.perf_counter()
     if not isinstance(frame_bgr, np.ndarray):
@@ -26,10 +29,18 @@ def process_frame(
     geometry_image, geometry_report = correct_auto(source)
     after_geometry = residual(geometry_image)
 
+    working = geometry_image
+    axial_report = None
+    if enable_axial:
+        kernel_b, kernel_r = axial_kernels if axial_kernels else (None, None)
+        working, axial_report = correct_axial(
+            geometry_image, kernel_b=kernel_b, kernel_r=kernel_r
+        )
+
     if enable_defringe:
-        final_image, fringe_report = defringe(geometry_image)
+        final_image, fringe_report = defringe(working)
     else:
-        final_image = geometry_image.copy()
+        final_image = working.copy()
         fringe_report = {
             "changed": 0.0,
             "zone": 0.0,
@@ -46,12 +57,17 @@ def process_frame(
     }
     changed = np.any(final_image != source, axis=2)
     report: Dict[str, object] = {
+        "axial": axial_report,
         "geometry": geometry_report_for_output,
         "residual_before_geometry": before_geometry,
         "residual_after_geometry": after_geometry,
         "defringe": fringe_report,
         "changed_fraction_total": float(changed.mean()),
-        "applied": bool(geometry_report["applied"] or fringe_report["corrected_pixels"]),
+        "applied": bool(
+            geometry_report["applied"]
+            or fringe_report["corrected_pixels"]
+            or (axial_report and axial_report["changed"])
+        ),
         "elapsed_seconds": 0.0,
     }
     report["elapsed_seconds"] = time.perf_counter() - started
@@ -62,5 +78,7 @@ def process_frame(
             "geometry": geometry_image,
             "final": final_image,
         }
+        if axial_report is not None:
+            stages["axial"] = working
         return final_image, report, stages
     return final_image, report

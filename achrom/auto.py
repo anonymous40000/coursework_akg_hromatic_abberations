@@ -433,8 +433,8 @@ def _disp(model, x, y):
 def _total_map(models, h, w):
     gy_n = h // GRID_STEP + 2
     gx_n = w // GRID_STEP + 2
-    xs = np.minimum(np.arange(gx_n) * GRID_STEP, w - 1).astype(np.float32)
-    ys = np.minimum(np.arange(gy_n) * GRID_STEP, h - 1).astype(np.float32)
+    xs = (np.arange(gx_n) * GRID_STEP).astype(np.float32)
+    ys = (np.arange(gy_n) * GRID_STEP).astype(np.float32)
     gx, gy = np.meshgrid(xs, ys)
     px, py = gx.copy(), gy.copy()
     for m in reversed(models):

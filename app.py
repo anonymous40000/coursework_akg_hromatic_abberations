@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox
 import cv2
 import numpy as np
 
+from achrom.axial import effective_sigma as measure_sigma, measure_axial_kernels
 from achrom.pipeline import process_frame
 
 RESULTS_DIR = Path("results")
@@ -81,6 +82,15 @@ class App:
             anchor="w",
         )
         cleanup_toggle.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.axial_var = tk.BooleanVar(value=False)
+        axial_toggle = tk.Checkbutton(
+            toolbar,
+            text="Компенсация продольной аберрации",
+            variable=self.axial_var,
+            anchor="w",
+        )
+        axial_toggle.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.status = tk.Label(
             root,
@@ -193,8 +203,9 @@ class App:
         stem = self._safe_stem(Path(path).stem)
         self._last_stem = stem
         cleanup_enabled = bool(self.defringe_var.get())
+        axial_enabled = bool(self.axial_var.get())
         log.info("Загружено %s (%dx%d)", path, frame.shape[1], frame.shape[0])
-        self._run_job(lambda: self._process_job(frame, stem, cleanup_enabled))
+        self._run_job(lambda: self._process_job(frame, stem, cleanup_enabled, axial_enabled))
 
     @staticmethod
     def _read_image(path):
@@ -212,14 +223,24 @@ class App:
         value = re.sub(r"[^\w.-]+", "_", stem, flags=re.UNICODE).strip("._")
         return value[:100] or "result"
 
-    def _process_job(self, frame, prefix, cleanup_enabled):
+    def _process_job(self, frame, prefix, cleanup_enabled, axial_enabled=False):
         started = time.perf_counter()
-        log.info("Начата обработка %dx%d; defringe=%s", frame.shape[1], frame.shape[0], cleanup_enabled)
+        log.info(
+            "Начата обработка %dx%d; defringe=%s; axial=%s",
+            frame.shape[1], frame.shape[0], cleanup_enabled, axial_enabled,
+        )
         final_image, report, stages = process_frame(
             frame,
             enable_defringe=cleanup_enabled,
+            enable_axial=axial_enabled,
             return_stages=True,
         )
+        if axial_enabled and report.get("axial"):
+            log.info(
+                "Продольная аберрация: sigma B=%.2f R=%.2f, время=%.2fс",
+                report["axial"]["sigma"]["b"], report["axial"]["sigma"]["r"],
+                report["axial"]["time"],
+            )
         geometry = report["geometry"]
         before = report["residual_before_geometry"]
         after = report["residual_after_geometry"]
@@ -255,7 +276,7 @@ class App:
     def _write_outputs(self, prefix, stages, report):
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         paths = {
-            "after": (RESULTS_DIR / prefix).with_suffix(".png"),
+            "after": RESULTS_DIR / (prefix + ".png"),
             "directory": str(RESULTS_DIR.resolve()),
         }
         self._write_image(paths["after"], stages["final"])
@@ -343,9 +364,37 @@ def _collect_cli_paths(args):
     return paths
 
 def _run_cli(args):
+    axial = "--axial" in args
+    args = [arg for arg in args if arg != "--axial"]
+    axial_kernels = None
+    if "--axial-cal" in args:
+        index = args.index("--axial-cal")
+        if index + 1 >= len(args):
+            print("Укажите путь к калибровочному кадру после --axial-cal")
+            return 2
+        cal_path = args[index + 1]
+        del args[index:index + 2]
+        cal_frame = App._read_image(cal_path)
+        if cal_frame is None:
+            print(f"Не удалось прочитать калибровочный кадр {cal_path}")
+            return 2
+        try:
+            kernel_b, kernel_r = measure_axial_kernels(cal_frame)
+        except (TypeError, ValueError) as error:
+            print(f"Кадр {cal_path} не подходит для калибровки: {error}")
+            return 2
+        axial_kernels = (kernel_b, kernel_r)
+        axial = True
+        print(
+            "Калибровка продольной аберрации: sigma B="
+            f"{measure_sigma(kernel_b):.2f} R={measure_sigma(kernel_r):.2f} px"
+        )
     paths = _collect_cli_paths(args)
     if not paths:
-        print("Использование: python app.py <фото или каталог> [...] (без аргументов — GUI)")
+        print(
+            "Использование: python app.py [--axial | --axial-cal <мишень>] "
+            "<фото или каталог> [...] (без аргументов — GUI)"
+        )
         return 2
     shim = App.__new__(App)
     failures = 0
@@ -358,7 +407,10 @@ def _run_cli(args):
         stem = App._safe_stem(Path(path).stem)
         log.info("[%d/%d] Обработка %s (%dx%d)", i, len(paths), path, frame.shape[1], frame.shape[0])
         try:
-            final, report, stages = process_frame(frame, return_stages=True)
+            final, report, stages = process_frame(
+                frame, enable_axial=axial, axial_kernels=axial_kernels,
+                return_stages=True,
+            )
             out = shim._write_outputs(stem, stages, report)
             print(f"[{i}/{len(paths)}] {path} -> {out['after']}")
             print("  " + shim._format_status(report, out["directory"]).replace("\n", "\n  "))
